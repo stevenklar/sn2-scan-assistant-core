@@ -9,6 +9,7 @@
 
 #include <Unreal/AActor.hpp>
 #include <Unreal/CoreUObject/UObject/Class.hpp>
+#include <Unreal/CoreUObject/UObject/UnrealType.hpp>
 #include <Unreal/UObject.hpp>
 #include <Unreal/UObjectGlobals.hpp>
 #include <Unreal/UnrealCoreStructs.hpp>
@@ -99,96 +100,150 @@ namespace ScannerAssistCore
                   StringType(mod_name));
     }
 
-    // ---- Reseed ----------------------------------------------------------
+    // ---- Reseed (chunked) -----------------------------------------------
 
-    auto Mod::reseed() -> void
+    // Number of actors processed per on_update tick. ~50µs/actor on AMD
+    // means a chunk of 200 caps each tick's reseed cost at ~10 ms. With
+    // ~2400 actors total, a full reseed completes in ~12 ticks (~200 ms
+    // wall time at 60 fps) without any single tick blocking the game
+    // thread for the old 120 ms hit.
+    static constexpr int kReseedChunkSize = 200;
+    static constexpr int kParentCount =
+        sizeof(kParentClasses) / sizeof(kParentClasses[0]);
+
+    auto Mod::reseedStart() -> void
     {
-        const auto t0 = std::chrono::steady_clock::now();
-        std::vector<CacheEntry> next;
-        next.reserve(m_cache.empty() ? 256 : m_cache.size());
+        m_reseed.next.clear();
+        m_reseed.next.reserve(m_cache.empty() ? 256 : m_cache.size());
+        m_reseed.rawList.clear();
+        m_reseed.rawIdx       = 0;
+        m_reseed.parentIdx    = 0;
+        m_reseed.totalSeen    = 0;
+        m_reseed.kept         = 0;
+        m_reseed.skipNoClass  = 0;
+        m_reseed.skipNotScan  = 0;
+        m_reseed.skipGathered = 0;
+        m_reseed.skipNoLoc    = 0;
+        m_reseed.startedAt    = std::chrono::steady_clock::now();
+        m_reseeding           = true;
+    }
 
-        std::size_t totalSeen = 0;
-        std::size_t kept = 0;
-        std::size_t skipNoClass = 0;
-        std::size_t skipNotScan = 0;
-        std::size_t skipGathered = 0;
-        std::size_t skipNoLoc = 0;
+    auto Mod::reseedStep() -> void
+    {
+        if (!m_reseeding) return;
 
-        for (const auto& parent : kParentClasses)
+        int processed = 0;
+        while (processed < kReseedChunkSize)
         {
-            std::vector<UObject*> raw;
-            UObjectGlobals::FindAllOf(parent.c_str(), raw);
-            totalSeen += raw.size();
-
-            for (UObject* obj : raw)
+            // Fetch next parent class's actor list when we've drained
+            // the current one (or on first entry).
+            if (m_reseed.rawIdx >= static_cast<int>(m_reseed.rawList.size()))
             {
-                if (!obj) continue;
-                UClass* cls = obj->GetClassPrivate();
-                if (!cls) { ++skipNoClass; continue; }
-                std::string cname = wideToUtf8(cls->GetName());
-                if (!Classification::isScannable(cname)) { ++skipNotScan; continue; }
-
-                // bHasBeenGathered: walk the class chain — the property
-                // lives on a parent (UWEWorldPopResourceBaseActor) not
-                // the BP leaf. Leaf-only lookup would return null and
-                // we'd (wrongly) count gathered actors as live.
-                auto* gathered = obj->GetValuePtrByPropertyNameInChain<bool>(STR("bHasBeenGathered"));
-                if (gathered && *gathered) { ++skipGathered; continue; }
-
-                AActor* actor = static_cast<AActor*>(obj);
-                FVector loc = actor->K2_GetActorLocation();
-
-                // Drop actors at exactly (0,0,0). That's the sentinel
-                // origin K2_GetActorLocation returns for things that
-                // don't actually have a world position — inventory
-                // items, items mid-spawn, etc. Without this filter, a
-                // momentary ghost station at (0,0,0) green-lights every
-                // such actor and we get phantom markers at distance
-                // ≈ |player - origin|.
-                //
-                // We deliberately do NOT also filter by bHidden:
-                // SN2 world resources are bHidden=true in normal play
-                // (probably LOD culling), and filtering on it wipes
-                // the cache to zero. The (0,0,0) check on its own
-                // is enough for the inventory case.
-                if (loc.X() == 0.0 && loc.Y() == 0.0 && loc.Z() == 0.0)
+                if (m_reseed.parentIdx >= kParentCount)
                 {
-                    ++skipNoLoc;
-                    continue;
+                    // All parents drained — swap in the new cache.
+                    m_cache = std::move(m_reseed.next);
+                    ++m_cacheVersion;
+                    m_cacheStaleRequested = false;
+                    m_reseeding = false;
+
+                    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - m_reseed.startedAt)
+                                        .count();
+                    Log::debug(
+                        STR("cache reseed v{}: seen={} kept={} (noClass={} notScan={} gathered={} noLoc={}) in {}ms (chunked)"),
+                        m_cacheVersion, m_reseed.totalSeen, m_reseed.kept,
+                        m_reseed.skipNoClass, m_reseed.skipNotScan,
+                        m_reseed.skipGathered, m_reseed.skipNoLoc, ms);
+                    return;
                 }
-
-                CacheEntry e;
-                e.token = Classification::resourceToken(cname);
-                e.size  = Classification::sizeBucket(cname);
-                e.cname = std::move(cname);
-                e.key   = wideToUtf8(obj->GetFullName());
-                e.X = loc.X();
-                e.Y = loc.Y();
-                e.Z = loc.Z();
-                next.push_back(std::move(e));
-                ++kept;
+                m_reseed.rawList.clear();
+                UObjectGlobals::FindAllOf(
+                    kParentClasses[m_reseed.parentIdx].c_str(), m_reseed.rawList);
+                m_reseed.totalSeen += m_reseed.rawList.size();
+                m_reseed.rawIdx     = 0;
+                ++m_reseed.parentIdx;
+                continue; // re-enter loop; new list may be empty.
             }
-        }
 
-        m_cache = std::move(next);
-        ++m_cacheVersion;
-        m_cacheStaleRequested = false;
-        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::steady_clock::now() - t0).count();
-        Log::debug(
-            STR("cache reseed v{}: seen={} kept={} (noClass={} notScan={} gathered={} noLoc={}) in {}ms"),
-            m_cacheVersion, totalSeen, kept,
-            skipNoClass, skipNotScan, skipGathered, skipNoLoc, ms);
+            UObject* obj = m_reseed.rawList[m_reseed.rawIdx++];
+            ++processed;
+            if (!obj) continue;
+
+            UClass* cls = obj->GetClassPrivate();
+            if (!cls) { ++m_reseed.skipNoClass; continue; }
+            std::string cname = wideToUtf8(cls->GetName());
+            if (!Classification::isScannable(cname)) { ++m_reseed.skipNotScan; continue; }
+
+            // bHasBeenGathered: cached per-class offset. The InChain
+            // walk used to fire 2400× per reseed; now ~20× (once per
+            // unique class) and the per-actor read is a direct
+            // pointer + offset deref.
+            std::int32_t gOff;
+            auto it = m_gatheredOffsets.find(cls);
+            if (it == m_gatheredOffsets.end())
+            {
+                FProperty* p = obj->GetPropertyByNameInChain(STR("bHasBeenGathered"));
+                gOff = p ? p->GetOffset_ForInternal() : -1;
+                m_gatheredOffsets[cls] = gOff;
+            }
+            else
+            {
+                gOff = it->second;
+            }
+            if (gOff >= 0)
+            {
+                const bool gathered = *reinterpret_cast<bool*>(
+                    reinterpret_cast<std::uint8_t*>(obj) + gOff);
+                if (gathered) { ++m_reseed.skipGathered; continue; }
+            }
+
+            AActor* actor = static_cast<AActor*>(obj);
+            FVector loc = actor->K2_GetActorLocation();
+
+            // Drop actors at exactly (0,0,0). That's the sentinel
+            // origin K2_GetActorLocation returns for things that
+            // don't have a world position — inventory items, mid-
+            // spawn, etc. We deliberately do NOT also filter by
+            // bHidden: SN2 world resources are bHidden=true in normal
+            // play (probably LOD culling), filtering on it wipes
+            // the cache to zero.
+            if (loc.X() == 0.0 && loc.Y() == 0.0 && loc.Z() == 0.0)
+            {
+                ++m_reseed.skipNoLoc;
+                continue;
+            }
+
+            CacheEntry e;
+            e.token = Classification::resourceToken(cname);
+            e.size  = Classification::sizeBucket(cname);
+            e.cname = std::move(cname);
+            e.key   = wideToUtf8(obj->GetFullName());
+            e.X = loc.X();
+            e.Y = loc.Y();
+            e.Z = loc.Z();
+            m_reseed.next.push_back(std::move(e));
+            ++m_reseed.kept;
+        }
     }
 
     auto Mod::reseedIfDue() -> void
     {
+        // If a reseed is in progress, keep stepping. Don't start a new
+        // one until the current one finishes (and the cadence timer
+        // fires again).
+        if (m_reseeding)
+        {
+            reseedStep();
+            return;
+        }
         const auto now = std::chrono::steady_clock::now();
         const auto sinceMs = std::chrono::duration_cast<std::chrono::milliseconds>(
                                  now - m_lastReseedAt).count();
         if (!m_cacheStaleRequested && sinceMs < kReseedEveryMs) return;
         m_lastReseedAt = now;
-        reseed();
+        reseedStart();
+        reseedStep(); // do the first chunk this tick so progress shows immediately.
     }
 
     // ---- Tick ------------------------------------------------------------
@@ -212,9 +267,24 @@ namespace ScannerAssistCore
 
         // Cache reseed gated on Lua-driven active flag. Lua flips it
         // true when the player is in a world AND the mod is enabled
-        // AND a station exists. Skipping when inactive saves the 20ms
-        // FindAllOf in menus / save load / mod-disabled states.
-        if (!m_active.load(std::memory_order_relaxed)) return;
+        // AND a station exists. Skipping when inactive saves the
+        // FindAllOf cost during menus / save-load / mod-disabled.
+        const bool active = m_active.load(std::memory_order_relaxed);
+        if (m_wasActive && !active)
+        {
+            // Active → inactive transition (world unload / mod off).
+            // UClass* pointers in m_gatheredOffsets may be unloaded
+            // along with the world; drop them so we re-resolve fresh
+            // when the player loads back in. Also abort any in-flight
+            // reseed since its rawList might point at freed actors.
+            m_gatheredOffsets.clear();
+            m_reseeding = false;
+            m_reseed.next.clear();
+            m_reseed.rawList.clear();
+        }
+        m_wasActive = active;
+
+        if (!active) return;
         reseedIfDue();
     }
 } // namespace ScannerAssistCore

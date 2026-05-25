@@ -22,10 +22,17 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <LuaMadeSimple/LuaMadeSimple.hpp>
 #include <Mod/CppUserModBase.hpp>
+
+namespace RC::Unreal
+{
+    class UClass;
+    class UObject;
+}
 
 namespace ScannerAssistCore
 {
@@ -100,10 +107,16 @@ namespace ScannerAssistCore
         // === Cache reseed ===
         // Game-thread only. Walks the native parent classes, filters
         // by scannable prefix + bHasBeenGathered, snapshots into
-        // m_cache, bumps m_cacheVersion. Cheap (no Lua-wrapper alloc)
-        // so no chunking needed.
+        // m_cache, bumps m_cacheVersion.
+        //
+        // The walk is CHUNKED across multiple on_update ticks so a
+        // single tick never blocks for the full FindAllOf + per-actor
+        // processing time (~120 ms on AMD for ~2400 actors). reseed
+        // progress lives in m_reseed; while m_reseeding is true, each
+        // on_update consumes at most kReseedChunkSize entries.
         auto reseedIfDue() -> void;
-        auto reseed() -> void;
+        auto reseedStart() -> void;
+        auto reseedStep()  -> void;
 
         // === Heartbeat ===
         std::chrono::steady_clock::time_point m_lastTick{};
@@ -114,6 +127,37 @@ namespace ScannerAssistCore
         std::uint64_t m_cacheVersion = 0;
         std::chrono::steady_clock::time_point m_lastReseedAt{};
         bool m_cacheStaleRequested = true; // force first reseed on startup
+
+        // === Chunked-reseed state ===
+        struct ReseedState
+        {
+            std::vector<CacheEntry> next;
+            std::vector<RC::Unreal::UObject*> rawList;
+            int rawIdx    = 0;
+            int parentIdx = 0;
+            std::size_t totalSeen    = 0;
+            std::size_t kept         = 0;
+            std::size_t skipNoClass  = 0;
+            std::size_t skipNotScan  = 0;
+            std::size_t skipGathered = 0;
+            std::size_t skipNoLoc    = 0;
+            std::chrono::steady_clock::time_point startedAt;
+        };
+        ReseedState m_reseed;
+        bool m_reseeding = false;
+
+        // Per-class `bHasBeenGathered` FProperty offset cache. The
+        // InChain walk we used to do per actor was ~5-10 µs on Intel
+        // and noticeably worse on AMD; with ~20 unique BP classes
+        // across 2400 actors we save 2380 walks per reseed.
+        // -1 means "this class doesn't have the property".
+        std::unordered_map<RC::Unreal::UClass*, std::int32_t> m_gatheredOffsets;
+
+        // Tracks the previous m_active state so on_update can detect
+        // active→inactive transitions (world unload, mod disable) and
+        // drop the per-class offset cache: UClass* pointers can be
+        // unloaded with the world.
+        bool m_wasActive = false;
 
         // Atomic because the setter might be called from the Lua
         // thread while on_update reads it — UE4SS routes both through

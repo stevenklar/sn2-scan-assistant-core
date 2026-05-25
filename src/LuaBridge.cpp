@@ -43,6 +43,7 @@ namespace
 namespace ScannerAssistCore
 {
     using namespace RC::LuaMadeSimple;
+    using namespace RC::Unreal;
 
     // ---- Heartbeat ------------------------------------------------------
 
@@ -394,6 +395,184 @@ namespace ScannerAssistCore
         return 1;
     }
 
+    // ---- Project points (batched) --------------------------------------
+
+    // Calling PlayerController.ProjectWorldLocationToScreen via the
+    // UE4SS Lua wrapper costs ~80µs per point. With 25 markers at
+    // 100Hz that's 200k µs/s = 20% of one CPU thread just for the
+    // projection step. AMD CPUs hit it especially hard because the
+    // wrapper path is branch-heavy.
+    //
+    // Doing the same UFunction call from C++ via ProcessEvent bypasses
+    // the Lua wrapper entirely. We resolve the parameter offsets on
+    // the function once, then just memcpy world location into the
+    // parm buffer per call. ~5–10µs per call. Plus only ONE Lua/C++
+    // bridge crossing per frame instead of N.
+
+    // Class-level metadata only. We deliberately do NOT cache the
+    // PlayerController instance — it gets recycled across world
+    // transitions / respawns / possession changes, and the Lua-driven
+    // invalidator can't be trusted to run before the next projection
+    // call. Calling ProcessEvent on a freed PC crashes the engine
+    // inside UObject::ProcessEvent (observed in user crash report).
+    //
+    // The UFunction + property offsets ARE stable across the session
+    // (they live on PlayerController's UClass, not on the instance) so
+    // those stay cached.
+    struct ProjectionCache
+    {
+        UFunction* fn = nullptr;
+        int32_t worldLocOffset    = -1;
+        int32_t screenLocOffset   = -1;
+        int32_t viewportRelOffset = -1;
+        int32_t returnValueOffset = -1;
+        std::size_t parmsSize     = 0;
+
+        auto clear() -> void
+        {
+            fn = nullptr;
+            // Offsets are reset on next resolve.
+        }
+    };
+    static ProjectionCache s_projCache;
+
+    // Resolve a live PlayerController per call. FindFirstOf walks the
+    // engine's live UObject table — the returned pointer is guaranteed
+    // valid for at least this call.
+    static auto resolveLivePC() -> UObject*
+    {
+        return UObjectGlobals::FindFirstOf(STR("PlayerController"));
+    }
+
+    static auto ensureProjectionCache(UObject* pc) -> bool
+    {
+        if (!pc) return false;
+        if (s_projCache.fn) return true;
+
+        UFunction* fn = pc->GetFunctionByNameInChain(STR("ProjectWorldLocationToScreen"));
+        if (!fn) return false;
+
+        int32_t wOff = -1, sOff = -1, vOff = -1, rOff = -1;
+        for (FProperty* p : TFieldRange<FProperty>(fn))
+        {
+            if (!p) continue;
+            const std::string n = wideToUtf8(p->GetName());
+            if      (n == "WorldLocation")            wOff = p->GetOffset_ForInternal();
+            else if (n == "ScreenLocation")           sOff = p->GetOffset_ForInternal();
+            else if (n == "bPlayerViewportRelative")  vOff = p->GetOffset_ForInternal();
+            else if (n == "ReturnValue")              rOff = p->GetOffset_ForInternal();
+        }
+        if (wOff < 0 || sOff < 0 || vOff < 0 || rOff < 0) return false;
+
+        s_projCache.fn                = fn;
+        s_projCache.worldLocOffset    = wOff;
+        s_projCache.screenLocOffset   = sOff;
+        s_projCache.viewportRelOffset = vOff;
+        s_projCache.returnValueOffset = rOff;
+        s_projCache.parmsSize         = static_cast<std::size_t>(fn->GetParmsSize());
+
+        Log::debug(
+            STR("projection: cached ProjectWorldLocationToScreen (WLoc={}, ScrLoc={}, VRel={}, Ret={}, parms={})"),
+            wOff, sOff, vOff, rOff, s_projCache.parmsSize);
+        return true;
+    }
+
+    // Lua-exposed cache invalidator. Kept callable from Lua for API
+    // stability, but the PC pointer is no longer cached — this now
+    // only forces re-resolution of the UFunction (defensive, e.g. on
+    // mod reload).
+    static auto lua_invalidateProjection(const Lua& /*lua*/) -> int
+    {
+        s_projCache.clear();
+        return 0;
+    }
+
+    // ---- Station UObject* cache (used by FetchOrbs) --------------------
+    //
+    // FetchOrbs used to call UObjectGlobals::FindAllOf("SN2BaseScannerStation")
+    // on every scan cycle (every 500 ms). FindAllOf walks the global UObject
+    // table — O(all_objects) per call. We get the same answer by keying the
+    // wanted full-names against a persistent map and only rebuilding when
+    // a requested name isn't in the cache.
+    //
+    // Lifecycle:
+    //   * Rebuilt on demand when any wantedName is missing.
+    //   * Cleared by lua_invalidateStations on world-gone / mod disable
+    //     so we never dereference a freed pointer post world-unload.
+    //   * Lua removes station entries on EndPlay, so the wantedNames set
+    //     never includes a station that's been destroyed in-world.
+    static std::unordered_map<std::string, UObject*> s_stationCache;
+
+    static auto lua_invalidateStations(const Lua& /*lua*/) -> int
+    {
+        s_stationCache.clear();
+        return 0;
+    }
+
+    // Lua call:
+    //   local results = ScannerAssistCore_ProjectPoints(points)
+    // where points = array of {X, Y, Z} world locations. Returns an
+    // array of {X, Y, ok} screen positions in RAW PIXEL coordinates
+    // — caller divides by viewport scale to get slate units. We don't
+    // include the scale here because the caller fetches it once per
+    // frame anyway and we'd just be marshaling extra data.
+    static auto lua_projectPoints(const Lua& lua) -> int
+    {
+        lua_State* L = lua.get_lua_state();
+
+        int nPoints = 0;
+        if (lua_istable(L, 1)) nPoints = static_cast<int>(luaL_len(L, 1));
+
+        lua_createtable(L, nPoints, 0);
+        if (nPoints == 0) return 1;
+
+        // Re-fetch the PlayerController every call. Caching it across
+        // frames crashes after world transitions / respawns because the
+        // pointer goes stale and ProcessEvent dereferences freed memory.
+        UObject* pc = resolveLivePC();
+        if (!ensureProjectionCache(pc)) return 1;
+
+        std::vector<uint8_t> buf(s_projCache.parmsSize);
+
+        for (int i = 1; i <= nPoints; ++i)
+        {
+            lua_geti(L, 1, i);
+            double x = 0, y = 0, z = 0;
+            bool gotPoint = false;
+            if (lua_istable(L, -1))
+            {
+                lua_getfield(L, -1, "X"); x = lua_tonumber(L, -1); lua_pop(L, 1);
+                lua_getfield(L, -1, "Y"); y = lua_tonumber(L, -1); lua_pop(L, 1);
+                lua_getfield(L, -1, "Z"); z = lua_tonumber(L, -1); lua_pop(L, 1);
+                gotPoint = true;
+            }
+            lua_pop(L, 1);
+
+            double screenX = 0.0, screenY = 0.0;
+            bool ok = false;
+            if (gotPoint)
+            {
+                std::memset(buf.data(), 0, s_projCache.parmsSize);
+                *reinterpret_cast<FVector*>(buf.data() + s_projCache.worldLocOffset) = FVector(x, y, z);
+                *reinterpret_cast<bool*>(buf.data() + s_projCache.viewportRelOffset) = false;
+
+                pc->ProcessEvent(s_projCache.fn, buf.data());
+
+                ok = *reinterpret_cast<bool*>(buf.data() + s_projCache.returnValueOffset);
+                FVector2D* sl = reinterpret_cast<FVector2D*>(buf.data() + s_projCache.screenLocOffset);
+                screenX = sl->X();
+                screenY = sl->Y();
+            }
+
+            lua_createtable(L, 0, 3);
+            lua_pushnumber(L, screenX); lua_setfield(L, -2, "X");
+            lua_pushnumber(L, screenY); lua_setfield(L, -2, "Y");
+            lua_pushboolean(L, ok);     lua_setfield(L, -2, "ok");
+            lua_seti(L, -2, i);
+        }
+        return 1;
+    }
+
     // ---- FetchOrbs ------------------------------------------------------
 
     // Reads each station's ActivePoints array (the scanner hologram
@@ -413,8 +592,6 @@ namespace ScannerAssistCore
     // cache the WorldLocation/Count offsets across calls. Offsets live
     // on the UScriptStruct, which is shared across instances — one
     // discovery per game run is enough.
-    using namespace RC::Unreal;
-
     static auto lua_fetchOrbs(const Lua& lua) -> int
     {
         lua_State* L = lua.get_lua_state();
@@ -443,8 +620,28 @@ namespace ScannerAssistCore
 
         if (wantedNames.empty()) return 1;
 
-        std::vector<UObject*> stations;
-        UObjectGlobals::FindAllOf(STR("SN2BaseScannerStation"), stations);
+        // Rebuild the station cache only when a wantedName isn't in it.
+        // Steady state (same stations as last call) = no FindAllOf.
+        bool needRebuild = false;
+        for (const auto& name : wantedNames)
+        {
+            if (s_stationCache.find(name) == s_stationCache.end())
+            {
+                needRebuild = true;
+                break;
+            }
+        }
+        if (needRebuild)
+        {
+            s_stationCache.clear();
+            std::vector<UObject*> stations;
+            UObjectGlobals::FindAllOf(STR("SN2BaseScannerStation"), stations);
+            for (UObject* st : stations)
+            {
+                if (!st) continue;
+                s_stationCache.emplace(wideToUtf8(st->GetFullName()), st);
+            }
+        }
 
         // Struct-field offset cache. The ActivePoint struct layout
         // doesn't change at runtime; one resolution per UScriptStruct
@@ -453,11 +650,12 @@ namespace ScannerAssistCore
         static int32_t s_countOffset    = -1;
         static const UScriptStruct* s_resolvedStruct = nullptr;
 
-        for (UObject* station : stations)
+        for (const auto& fullName : wantedNames)
         {
+            auto it = s_stationCache.find(fullName);
+            if (it == s_stationCache.end()) continue;
+            UObject* station = it->second;
             if (!station) continue;
-            const std::string fullName = wideToUtf8(station->GetFullName());
-            if (wantedNames.find(fullName) == wantedNames.end()) continue;
 
             FProperty* prop = station->GetPropertyByNameInChain(STR("ActivePoints"));
             if (!prop) continue;
@@ -530,5 +728,8 @@ namespace ScannerAssistCore
         lua.register_function("ScannerAssistCore_ScanTally",        &lua_scanTally);
         lua.register_function("ScannerAssistCore_OrbsDedupe",       &lua_orbsDedupe);
         lua.register_function("ScannerAssistCore_FetchOrbs",        &lua_fetchOrbs);
+        lua.register_function("ScannerAssistCore_ProjectPoints",    &lua_projectPoints);
+        lua.register_function("ScannerAssistCore_InvalidateProjection", &lua_invalidateProjection);
+        lua.register_function("ScannerAssistCore_InvalidateStations",   &lua_invalidateStations);
     }
 } // namespace ScannerAssistCore
